@@ -6,8 +6,6 @@ from pathlib import Path
 
 import requests
 import tiktoken
-from openai import AsyncOpenAI, OpenAI
-from openai.types.beta.threads.run import Run
 
 from virtual_lab.constants import (
     DEFAULT_FINETUNING_EPOCHS,
@@ -91,8 +89,9 @@ def run_pubmed_search(
     :return: The full text of the top matching article.
     """
     # Print search query
+    article_scope = "abstracts" if abstract_only else "full text"
     print(
-        f'Searching PubMed Central for {num_articles} articles ({'abstracts' if abstract_only else 'full text'}) with query: "{query}"'
+        f"Searching PubMed Central for {num_articles} articles ({article_scope}) with query: \"{query}\""
     )
 
     # Perform PubMed Central search for query to get PMC ID
@@ -119,7 +118,8 @@ def run_pubmed_search(
         if title is None:
             continue
 
-        texts.append(f"PMCID = {pmcid}\n\nTitle = {title}\n\n{'\n\n'.join(content)}")
+        body = "\n\n".join(content)
+        texts.append(f"PMCID = {pmcid}\n\nTitle = {title}\n\n{body}")
         titles.append(title)
         pmcids.append(pmcid)
 
@@ -141,123 +141,26 @@ def run_pubmed_search(
     return combined_text
 
 
-def run_tools(run: Run) -> list[dict[str, str]]:
-    """Runs the tools in a required action.
+def run_tools(tool_calls) -> list[dict[str, str]]:
+    """Execute tool calls requested by the model."""
 
-    :param run: The run to run tools for.
-    :return: A list of tool outputs.
-    """
-    # Define the list to store tool outputs
-    tool_outputs = []
+    tool_outputs: list[dict[str, str]] = []
 
-    # Loop through each tool in the required action and run it
-    for tool in run.required_action.submit_tool_outputs.tool_calls:
-        if tool.function.name == PUBMED_TOOL_NAME:
-            # Extract the query from the tool arguments
-            args_dict = json.loads(tool.function.arguments)
+    for tool_call in tool_calls:
+        tool_name = getattr(tool_call, "name", None)
 
-            # Run the tool and append the output to the list of tool outputs
+        if tool_name == PUBMED_TOOL_NAME:
+            args_dict = json.loads(tool_call.arguments)
             tool_outputs.append(
                 {
-                    "tool_call_id": tool.id,
+                    "call_id": tool_call.call_id,
                     "output": run_pubmed_search(**args_dict),
                 }
             )
         else:
-            raise ValueError(f"Unknown tool: {tool.function.name}")
+            raise ValueError(f"Unknown tool: {tool_name}")
 
     return tool_outputs
-
-
-def get_messages(client: OpenAI, thread_id: str) -> list[dict]:
-    """Gets messages from a thread.
-
-    :param client: The OpenAI client.
-    :param thread_id: The ID of the thread to get messages from.
-    :return: A list of messages.
-    """
-    # Set up
-    messages = []
-    last_message = None
-    params = {
-        "thread_id": thread_id,
-        "limit": 100,
-        "order": "asc",
-    }
-
-    # Get all messages from the thread page by page
-    while True:
-        # Set up params
-        if last_message is not None:
-            params["after"] = last_message["id"]
-        elif "after" in params:
-            del params["after"]
-
-        # Get messages
-        new_messages = [
-            message.to_dict() for message in client.beta.threads.messages.list(**params)
-        ]
-
-        # Append new messages
-        messages += new_messages
-
-        # Break if no more messages
-        if len(new_messages) < params["limit"]:
-            break
-
-        # Get last message
-        last_message = messages[-1]
-
-    # Verify all message content is length 1
-    assert all(len(message["content"]) == 1 for message in messages)
-
-    return messages
-
-
-async def async_get_messages(client: AsyncOpenAI, thread_id: str) -> list[dict]:
-    """Gets messages from a thread.
-
-    :param client: The async OpenAI client.
-    :param thread_id: The ID of the thread to get messages from.
-    :return: A list of messages.
-    """
-    # Set up
-    messages = []
-    last_message = None
-    params = {
-        "thread_id": thread_id,
-        "limit": 100,
-        "order": "asc",
-    }
-
-    # Get all messages from the thread page by page
-    while True:
-        # Set up params
-        if last_message is not None:
-            params["after"] = last_message["id"]
-        elif "after" in params:
-            del params["after"]
-
-        # Get messages
-        new_messages = [
-            message.to_dict()
-            async for message in client.beta.threads.messages.list(**params)
-        ]
-
-        # Append new messages
-        messages += new_messages
-
-        # Break if no more messages
-        if len(new_messages) < params["limit"]:
-            break
-
-        # Get last message
-        last_message = messages[-1]
-
-    # Verify all message content is length 1
-    assert all(len(message["content"]) == 1 for message in messages)
-
-    return messages
 
 
 def count_tokens(string: str, encoding_name: str = "cl100k_base") -> int:

@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Literal
 
 from openai import OpenAI
+from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+from openai.types.responses.response_output_message import ResponseOutputMessage
+from openai.types.responses.response_output_text import ResponseOutputText
 from tqdm import trange, tqdm
 
 from virtual_lab.agent import Agent
@@ -21,15 +24,70 @@ from virtual_lab.prompts import (
     team_meeting_team_member_prompt,
 )
 from virtual_lab.utils import (
-    convert_messages_to_discussion,
     count_discussion_tokens,
     count_tokens,
-    get_messages,
     get_summary,
     print_cost_and_time,
     run_tools,
     save_meeting,
 )
+
+
+def _build_input_messages(agent: Agent, discussion: list[dict[str, str]]) -> list[dict]:
+    """Construct the request payload for the Responses API."""
+
+    input_messages: list[dict] = [
+        {
+            "role": "system",
+            "type": "message",
+            "content": [{"type": "text", "text": agent.prompt}],
+        }
+    ]
+
+    for turn in discussion:
+        role = "assistant" if turn["agent"] == agent.title else "user"
+        input_messages.append(
+            {
+                "role": role,
+                "type": "message",
+                "content": [{"type": "text", "text": turn["message"]}],
+            }
+        )
+
+    return input_messages
+
+
+def _extract_response_text(response_output: list | None) -> str:
+    """Extract assistant text from a Responses API payload."""
+
+    if response_output is None:
+        return ""
+
+    texts: list[str] = []
+    for item in response_output:
+        if isinstance(item, ResponseOutputMessage):
+            for content in item.content:
+                if isinstance(content, ResponseOutputText):
+                    text = content.text.strip()
+                    if text:
+                        texts.append(text)
+
+    return "\n\n".join(texts)
+
+
+def _collect_function_calls(
+    response_output: list | None,
+) -> list[ResponseFunctionToolCall]:
+    """Return function tool calls found in a response output payload."""
+
+    if response_output is None:
+        return []
+
+    return [
+        item
+        for item in response_output
+        if isinstance(item, ResponseFunctionToolCall)
+    ]
 
 
 def run_meeting(
@@ -100,47 +158,35 @@ def run_meeting(
     else:
         team = [team_member] + [SCIENTIFIC_CRITIC]
 
-    # Set up tools
-    assistant_params = {"tools": [PUBMED_TOOL_DESCRIPTION]} if pubmed_search else {}
+    # Prepare tool definitions
+    tools = [PUBMED_TOOL_DESCRIPTION] if pubmed_search else None
 
-    # Set up the assistants
-    agent_to_assistant = {
-        agent: client.beta.assistants.create(
-            name=agent.title,
-            instructions=agent.prompt,
-            model=agent.model,
-            **assistant_params,
-        )
-        for agent in team
-    }
-
-    # Map assistant IDs to agents
-    assistant_id_to_title = {
-        assistant.id: agent.title for agent, assistant in agent_to_assistant.items()
-    }
+    # Track running discussion locally
+    discussion: list[dict[str, str]] = []
 
     # Set up tool token count
     tool_token_count = 0
 
-    # Set up the thread
-    thread = client.beta.threads.create()
-
     # Initial prompt for team meeting
     if meeting_type == "team":
-        client.beta.threads.messages.create(
-            thread_id=thread.id,
-            role="user",
-            content=team_meeting_start_prompt(
-                team_lead=team_lead,
-                team_members=team_members,
-                agenda=agenda,
-                agenda_questions=agenda_questions,
-                agenda_rules=agenda_rules,
-                summaries=summaries,
-                contexts=contexts,
-                num_rounds=num_rounds,
-            ),
+        discussion.append(
+            {
+                "agent": "User",
+                "message": team_meeting_start_prompt(
+                    team_lead=team_lead,
+                    team_members=team_members,
+                    agenda=agenda,
+                    agenda_questions=agenda_questions,
+                    agenda_rules=agenda_rules,
+                    summaries=summaries,
+                    contexts=contexts,
+                    num_rounds=num_rounds,
+                ),
+            }
         )
+
+    # Token accounting (input/output/max tracked separately from tools)
+    token_counts = {"input": 0, "output": 0, "max": 0}
 
     # Loop through rounds
     for round_index in trange(num_rounds + 1, desc="Rounds (+ Final Round)"):
@@ -194,64 +240,94 @@ def run_meeting(
                             critic=SCIENTIFIC_CRITIC, agent=team_member
                         )
 
-            # Create message from user to agent
-            client.beta.threads.messages.create(
-                thread_id=thread.id,
-                role="user",
-                content=prompt,
-            )
+            # Add orchestrator prompt to running discussion
+            discussion.append({"agent": "User", "message": prompt})
 
-            # Run the agent
-            run = client.beta.threads.runs.create_and_poll(
-                thread_id=thread.id,
-                assistant_id=agent_to_assistant[agent].id,
-                model=agent.model,
-                temperature=temperature,
-            )
+            # Build request payload for the current agent
+            input_messages = _build_input_messages(agent=agent, discussion=discussion)
 
-            # Check if run requires action
-            if run.status == "requires_action":
-                # Run the tools
-                tool_outputs = run_tools(run=run)
+            # Run the agent with the Responses API
+            response_kwargs = {
+                "model": agent.model,
+                "input": input_messages,
+                "temperature": temperature,
+            }
+            if tools is not None:
+                response_kwargs["tools"] = tools
+
+            response = client.responses.create(**response_kwargs)
+
+            usage = response.usage
+            if usage is not None:
+                token_counts["input"] += usage.input_tokens
+                token_counts["output"] += usage.output_tokens
+                token_counts["max"] = max(token_counts["max"], usage.total_tokens)
+
+            # Handle any function tool calls
+            while True:
+                tool_calls = _collect_function_calls(response.output)
+                if not tool_calls:
+                    break
+
+                tool_outputs = run_tools(tool_calls=tool_calls)
 
                 # Update tool token count
                 tool_token_count += sum(
                     count_tokens(tool_output["output"]) for tool_output in tool_outputs
                 )
 
-                # Submit the tool outputs
-                run = client.beta.threads.runs.submit_tool_outputs_and_poll(
-                    thread_id=thread.id, run_id=run.id, tool_outputs=tool_outputs
+                # Surface tool outputs in the visible discussion
+                discussion.append(
+                    {
+                        "agent": "User",
+                        "message": "Tool Output:\n\n"
+                        + "\n\n".join(
+                            tool_output["output"] for tool_output in tool_outputs
+                        ),
+                    }
                 )
 
-                # Add tool outputs to the thread so it's visible for later rounds
-                client.beta.threads.messages.create(
-                    thread_id=thread.id,
-                    role="user",
-                    content="Tool Output:\n\n"
-                    + "\n\n".join(
-                        tool_output["output"] for tool_output in tool_outputs
-                    ),
+                # Provide tool outputs back to the model
+                response = client.responses.create(
+                    model=agent.model,
+                    previous_response_id=response.id,
+                    input=[
+                        {
+                            "type": "function_call_output",
+                            "call_id": tool_output["call_id"],
+                            "output": tool_output["output"],
+                        }
+                        for tool_output in tool_outputs
+                    ],
                 )
 
-            # Check run status
-            if run.status != "completed":
-                raise ValueError(f"Run failed: {run.status}")
+                usage = response.usage
+                if usage is not None:
+                    token_counts["input"] += usage.input_tokens
+                    token_counts["output"] += usage.output_tokens
+                    token_counts["max"] = max(
+                        token_counts["max"], usage.total_tokens
+                    )
+
+            if response.status != "completed":
+                raise ValueError(f"Response failed: {response.status}")
+
+            response_text = _extract_response_text(response.output)
+            if not response_text:
+                raise ValueError("Model returned an empty response")
+
+            discussion.append({"agent": agent.title, "message": response_text})
 
             # If final round, only team lead or team member responds
             if round_index == num_rounds:
                 break
 
-    # Get messages from the discussion
-    messages = get_messages(client=client, thread_id=thread.id)
-
-    # Convert messages to discussion format
-    discussion = convert_messages_to_discussion(
-        messages=messages, assistant_id_to_title=assistant_id_to_title
-    )
-
-    # Count discussion tokens
-    token_counts = count_discussion_tokens(discussion=discussion)
+    # Fallback to heuristic token counting if usage details were unavailable
+    if token_counts["input"] == 0 and token_counts["output"] == 0:
+        token_counts = count_discussion_tokens(discussion=discussion)
+    else:
+        heuristic_counts = count_discussion_tokens(discussion=discussion)
+        token_counts["max"] = max(token_counts["max"], heuristic_counts["max"])
 
     # Add tool token count to total token count
     token_counts["tool"] = tool_token_count
