@@ -90,7 +90,10 @@ def format_prompt_list(prompts: Iterable[str]) -> str:
     :param prompts: The prompts.
     :return: The prompts formatted as a numbered list.
     """
-    return f"{'\n\n'.join(f'{i + 1}. {prompt}' for i, prompt in enumerate(prompts))}"
+    numbered_prompts = "\n\n".join(
+        f"{index + 1}. {prompt}" for index, prompt in enumerate(prompts)
+    )
+    return numbered_prompts
 
 
 def format_agenda(
@@ -153,7 +156,8 @@ def format_references(
         for reference_index, reference in enumerate(references)
     ]
 
-    return f"{intro}\n\n{'\n\n'.join(formatted_references)}\n\n"
+    joined_references = "\n\n".join(formatted_references)
+    return f"{intro}\n\n{joined_references}\n\n"
 
 
 # Team meeting prompts
